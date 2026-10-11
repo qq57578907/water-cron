@@ -1,0 +1,333 @@
+# ============================================================
+# 停水公告 · 自动抓取（GitHub Actions 版）
+#
+# 作用：由 GitHub 的服务器每隔 30 分钟自动跑一次 —— 抓取自来水公司最新停水公告，
+#       写入云数据库。不需要任何一台个人电脑开机，也不需要买服务器，费用 0 元。
+#
+# 你要做的只有两件事：
+#   1. 在这个仓库的 Settings → Secrets and variables → Actions 里，新建一个 Secret，
+#      名字叫 STOP_INGEST_SECRET，值粘贴我给你的那串口令。
+#   2. 到 Actions 标签页，选「停水公告 · 定时抓取」，点 Run workflow 试跑一次。
+#
+# 这个文件本身不用改（改频率见下面的 cron 行）。
+# ============================================================
+
+name: 停水公告 · 定时抓取
+
+on:
+  schedule:
+    # 每 30 分钟一次。刻意避开整点（:00 / :30 是全世界定时任务的拥堵点，容易排队延迟甚至被丢弃），
+    # 错开 7 分钟反而更准时 ⇒ 北京时间每小时 :07 和 :37 各跑一次。
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 只抓取不写库（测试用）
+        type: boolean
+        default: false
+
+# 「每日保活」那一步需要把运行记录提交回仓库
+permissions:
+  contents: write
+
+# 防止两次运行叠在一起
+concurrency:
+  group: fetch-stop-supply
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 抓取公告并写入云库
+        id: fetch
+        env:
+          INGEST_SECRET: ${{ secrets.STOP_INGEST_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: |
+          set -e
+          cat > /tmp/fetch.js <<'JSEOF'
+          /**
+           * 停水公告 · 自动抓取脚本（GitHub Actions 版）
+           *
+           * 用途：由 GitHub 的服务器每隔 30 分钟自动执行一次，
+           *       去自来水公司公告接口取最新数据，写进云库。
+           *       完全不依赖任何一台个人电脑。
+           *
+           * 流程：
+           *   1. 从云库视图 v_stop_source 读数据源配置（公告页链接 / 接口缓存）
+           *   2. 定出真正的上游接口地址（优先用缓存，否则从公告页链接推导）
+           *   3. POST 抓取公告列表
+           *   4. 清洗归一化（去首尾空白、去重、字段映射）
+           *   5. 调云库 RPC stop_ingest 批量写入 stop_supply 表
+           *
+           * 环境变量：
+           *   INGEST_SECRET  写入口令（存在 GitHub 仓库的 Secrets 里，代码里不写明文）
+           *   DRY_RUN        =1 时只抓取不写库（用于手动测试）
+           *
+           * 退出码：0=成功，1=失败（失败会让 Actions 页面显示红叉）
+           */
+
+          const https = require('https')
+          const http = require('http')
+          const { URL } = require('url')
+
+          // ===== 云服务接入常量 =====
+          // base 与 access key 来自小程序 utils/cloud-config.js，是小程序包里本来就有的公开客户端凭据
+          const CLOUD_BASE = 'https://mp-api.app.workbuddy.host/.cloud/database/rest'
+          const ACCESS_KEY = 'wbpk_vksGiyIrQyTgsh35gfMp16_MzBSIrIYQ5pL3T4sO3WvfFYM6mekxFr6'
+
+          const INGEST_SECRET = process.env.INGEST_SECRET || ''
+          const DRY_RUN = String(process.env.DRY_RUN || '') === '1'
+
+          // ===== 抓取参数 =====
+          const PAGE_SIZE = 40
+          const TIMEOUT_MS = 20000
+          const DEFAULT_CITY = 'huludao'
+          const DEFAULT_TENANT = '000200'
+
+          /** 极简 HTTP(S) 请求，返回 { status, text } */
+          function request(method, urlStr, bodyStr, headers) {
+            return new Promise((resolve, reject) => {
+              let u
+              try {
+                u = new URL(urlStr)
+              } catch (e) {
+                reject(new Error('bad_url:' + urlStr))
+                return
+              }
+              const lib = u.protocol === 'http:' ? http : https
+              const req = lib.request(
+                {
+                  method: method,
+                  hostname: u.hostname,
+                  port: u.port || (u.protocol === 'http:' ? 80 : 443),
+                  path: u.pathname + u.search,
+                  headers: Object.assign(
+                    { 'User-Agent': 'MiniProgramWaterCron/1.0', Accept: 'application/json' },
+                    headers || {}
+                  )
+                },
+                function (res) {
+                  let data = ''
+                  res.setEncoding('utf8')
+                  res.on('data', function (c) {
+                    data += c
+                  })
+                  res.on('end', function () {
+                    resolve({ status: res.statusCode, text: data })
+                  })
+                }
+              )
+              req.on('error', function (e) {
+                reject(new Error('network:' + (e && e.message ? e.message : String(e))))
+              })
+              req.setTimeout(TIMEOUT_MS, function () {
+                req.destroy(new Error('timeout'))
+              })
+              if (bodyStr) req.write(bodyStr)
+              req.end()
+            })
+          }
+
+          /** 第 1 步：读数据源配置 */
+          async function loadSource() {
+            const url = CLOUD_BASE + '/v_stop_source?select=page_url,api_url,api_body'
+            const r = await request('GET', url, null, { 'x-wb-webapp-access-key': ACCESS_KEY })
+            if (r.status !== 200) throw new Error('read_source_http_' + r.status)
+            let rows
+            try {
+              rows = JSON.parse(r.text)
+            } catch (e) {
+              throw new Error('read_source_not_json')
+            }
+            const row = Array.isArray(rows) ? rows[0] : rows
+            if (!row) throw new Error('read_source_empty')
+            return row
+          }
+
+          /**
+           * 第 2 步：定出上游接口
+           * 优先用配置里缓存的接口地址；缓存为空时，从「公告页面链接」推导：
+           *   页面 https://<host>/stopwater/<城市拼音>/list?tenantId=000200
+           *   接口 https://<host>/scheduling/prod-api/no-login/small-program/stop-supply/page/<城市拼音>
+           * 这样管理端换一个公告页链接后，脚本会自动跟着走，不用改代码。
+           */
+          function resolveEndpoint(src) {
+            if (src.api_url) {
+              let body = { tId: DEFAULT_TENANT, pageNum: 1, pageSize: PAGE_SIZE }
+              if (src.api_body) {
+                try {
+                  const cached = JSON.parse(src.api_body)
+                  if (cached && typeof cached === 'object') body = Object.assign(body, cached)
+                } catch (e) {
+                  /* 缓存坏了就只用默认值 */
+                }
+              }
+              body.pageNum = 1
+              body.pageSize = PAGE_SIZE
+              return { apiUrl: src.api_url, apiBody: body, from: 'cache' }
+            }
+
+            if (!src.page_url) throw new Error('no_source_url')
+
+            let u
+            try {
+              u = new URL(String(src.page_url).trim())
+            } catch (e) {
+              throw new Error('bad_source_url')
+            }
+            const m = u.pathname.match(/\/stopwater\/([^/]+)\//)
+            const city = m ? m[1] : DEFAULT_CITY
+            const tId = u.searchParams.get('tenantId') || DEFAULT_TENANT
+            const apiUrl =
+              u.protocol + '//' + u.host + '/scheduling/prod-api/no-login/small-program/stop-supply/page/' + city
+            return { apiUrl: apiUrl, apiBody: { tId: tId, pageNum: 1, pageSize: PAGE_SIZE }, from: 'derived' }
+          }
+
+          /** 第 3 步：抓上游公告列表 */
+          async function fetchList(apiUrl, apiBody) {
+            const r = await request('POST', apiUrl, JSON.stringify(apiBody), {
+              'Content-Type': 'application/json'
+            })
+            if (r.status !== 200) throw new Error('upstream_http_' + r.status)
+            let j
+            try {
+              j = JSON.parse(r.text)
+            } catch (e) {
+              throw new Error('upstream_not_json')
+            }
+            const list = j && j.result && j.result.list
+            if (!Array.isArray(list)) throw new Error('upstream_bad_shape:' + String(r.text).slice(0, 120))
+            return list
+          }
+
+          /** 空值安全取字符串 */
+          function str(v) {
+            return v == null ? '' : String(v).trim()
+          }
+
+          /**
+           * 第 4 步：清洗归一化
+           * - timespan 必须去首尾空白（上游「进行中」公告形如 "10月11日 16:00 - "，尾带空格，
+           *   否则去重键与库里不一致，停水页会出现重复两行）
+           * - 按 (area_name, timespan) 去重，避免同一批里重复键导致写入冲突
+           */
+          function normalize(list) {
+            const out = []
+            const seen = Object.create(null)
+            for (let i = 0; i < list.length; i++) {
+              const it = list[i]
+              if (!it || typeof it !== 'object') continue
+              const areaName = str(it.areaName)
+              const timespan = str(it.time)
+              if (!areaName || !timespan) continue
+              const key = areaName + '\u0000' + timespan
+              if (seen[key]) continue
+              seen[key] = true
+
+              const sc = it.stopStatusCode
+              const statusCode =
+                sc === null || sc === undefined || sc === ''
+                  ? null
+                  : Number.isFinite(Number(sc))
+                    ? Number(sc)
+                    : null
+
+              out.push({
+                area_name: areaName,
+                reason: str(it.reason) || null,
+                record_name: str(it.recordName) || null,
+                timespan: timespan,
+                status_code: statusCode,
+                status_desc: str(it.stopStatusDesc) || null
+              })
+            }
+            return out
+          }
+
+          /** 第 5 步：写入云库 */
+          async function ingest(rows) {
+            const r = await request(
+              'POST',
+              CLOUD_BASE + '/rpc/stop_ingest',
+              JSON.stringify({ p_secret: INGEST_SECRET, p_rows: rows }),
+              { 'Content-Type': 'application/json', 'x-wb-webapp-access-key': ACCESS_KEY }
+            )
+            if (r.status !== 200) {
+              throw new Error('ingest_http_' + r.status + ':' + String(r.text).slice(0, 200))
+            }
+            try {
+              return JSON.parse(r.text)
+            } catch (e) {
+              return { raw: String(r.text).slice(0, 200) }
+            }
+          }
+
+          /** 主流程 */
+          async function run() {
+            if (!DRY_RUN && !INGEST_SECRET) throw new Error('missing_INGEST_SECRET')
+
+            const src = await loadSource()
+            const ep = resolveEndpoint(src)
+            const list = await fetchList(ep.apiUrl, ep.apiBody)
+            const rows = normalize(list)
+            if (rows.length === 0) throw new Error('empty_list')
+
+            let db = null
+            if (!DRY_RUN) db = await ingest(rows)
+
+            const localCount = rows.filter(function (r) {
+              const s = r.area_name + '|' + (r.record_name || '') + '|' + (r.reason || '')
+              return s.indexOf('阳光新城') >= 0
+            }).length
+
+            return {
+              ok: true,
+              dryRun: DRY_RUN,
+              endpointFrom: ep.from,
+              fetched: list.length,
+              ready: rows.length,
+              local: localCount,
+              db: db
+            }
+          }
+
+          run()
+            .then(function (summary) {
+              console.log('[water-cron] 成功 ' + JSON.stringify(summary))
+              process.exit(0)
+            })
+            .catch(function (e) {
+              const msg = e && e.message ? e.message : String(e)
+              console.error('[water-cron] 失败：' + msg)
+              process.exit(1)
+            })
+          JSEOF
+          node /tmp/fetch.js
+
+      - name: 记录运行日志（兼作保活，防止 60 天无活动被自动停用）
+        if: always()
+        run: |
+          mkdir -p logs
+          DATE=$(date -u +%F)
+          LAST=$(tail -n 1 logs/runs.log 2>/dev/null | cut -d' ' -f1)
+          if [ "$LAST" = "$DATE" ]; then
+            echo "今天已经记录过，跳过"
+            exit 0
+          fi
+          echo "$DATE $(date -u +%H:%M:%S) UTC 结果=${{ steps.fetch.outcome }}" >> logs/runs.log
+          git config user.name "water-cron"
+          git config user.email "water-cron@users.noreply.github.com"
+          git add logs/runs.log
+          git commit -m "运行记录 $DATE"
+          git push
